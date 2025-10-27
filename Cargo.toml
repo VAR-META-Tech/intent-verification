@@ -1,0 +1,14 @@
+[package]
+name = "intent-verification"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-openai = "0.30.1"
+dotenvy = "0.15.7"
+tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+
