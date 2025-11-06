@@ -1,11 +1,10 @@
-use std::env;
-
-use colored::Colorize;
+use colored::*;
 use dotenvy::dotenv;
 use intent_verification::analyze_repository_changes;
+use std::env;
 
-#[tokio::main]
-async fn main() {
+#[tokio::test]
+async fn test_analyze_repository_changes() {
     // Load .env file
     dotenv().ok();
 
