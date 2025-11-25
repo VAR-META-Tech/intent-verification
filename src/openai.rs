@@ -2,8 +2,9 @@ use async_openai::{
     Client,
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
-        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+        CreateChatCompletionRequest,
     },
 };
 
@@ -237,20 +238,22 @@ Prompt:
 ///
 /// # Arguments
 /// * `api_key` - OpenAI API key
-/// * `repo_url` - Git repository URL
-/// * `commit1` - First commit hash (before changes)
-/// * `commit2` - Second commit hash (after changes)
+/// * `test_repo_url` - Git repository URL to read test targets from
+/// * `test_commit` - Commit hash to read test target code from
+/// * `solution_repo_url` - Git repository URL for the solution/changes
+/// * `solution_commit1` - First commit hash (before changes)
+/// * `solution_commit2` - Second commit hash (after changes)
 /// * `user_intent` - Original user prompt describing what should work
 ///
 /// # Returns
 /// * `IntentVerificationResult` - Analysis of whether changes fulfill the intent
 pub async fn verify_test_intent_with_changes(
     api_key: &str,
+    test_repo_url: &str,
+    test_commit: &str,
     solution_repo_url: &str,
     solution_commit1: &str,
     solution_commit2: &str,
-    test_repo_url: &str,
-    test_commit: &str,
     user_intent: &str,
 ) -> Result<IntentVerificationResult, Box<dyn std::error::Error>> {
     // First, extract test targets from the user intent using AI
@@ -262,6 +265,16 @@ pub async fn verify_test_intent_with_changes(
     // Get changed files from git
     let file_changes =
         crate::git::get_git_changed_files(solution_repo_url, solution_commit1, solution_commit2)?;
+
+    println!(
+        "📝 Found {} changed files between commits {} and {}",
+        file_changes.len(),
+        solution_commit1,
+        solution_commit2
+    );
+    for (i, fc) in file_changes.iter().enumerate() {
+        println!("  {}. {} [{:?}]", i + 1, fc.path, fc.status);
+    }
 
     let mut file_analyses = Vec::new();
     let mut total_supporting = 0;
@@ -364,81 +377,28 @@ async fn analyze_file_for_test_intent(
         });
     }
 
-    // Prepare context for AI analysis with actual target code
-    let target_functions = targets_with_code.targets.functions.join(", ");
-    let target_files = targets_with_code.targets.files.join(", ");
+    // Build structured messages using helper functions
+    let config = OpenAIConfig::new().with_api_key(api_key);
+    let client = Client::with_config(config);
 
-    // Include actual function implementations in context
-    let mut function_context = String::new();
-    for func in &targets_with_code.function_contents {
-        if let Some(ref code) = func.content {
-            function_context.push_str(&format!(
-                "\n\nTarget Function '{}' (in {}):\n```\n{}\n```",
-                func.name,
-                func.file_path.as_deref().unwrap_or("unknown"),
-                code
-            ));
-        }
-    }
+    let mut messages = vec![intent_verification_system_rules()];
+    messages.extend(add_test_target_context(targets_with_code));
+    messages.push(add_file_change_context(file_change, user_intent));
 
-    // Include target file info
-    let mut file_context = String::new();
-    for file in &targets_with_code.file_contents {
-        if file.error.is_none() {
-            file_context.push_str(&format!(
-                "\n\nTarget File '{}': {} bytes of code",
-                file.path,
-                file.content.len()
-            ));
-        }
-    }
+    let request = CreateChatCompletionRequest {
+        model: "gpt-3.5-turbo".to_string(),
+        messages,
+        ..Default::default()
+    };
 
-    let prompt = format!(
-        r#"Analyze if the following code changes support making the specified tests work.
+    let response = client.chat().create(request).await?;
+    let response_text = response
+        .choices
+        .get(0)
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_else(|| "No response.".to_string());
 
-User Intent: "{}"
-
-Target Functions: {}
-Target Files: {}
-
-Context - What needs to work:{}{}
-
-Changed File: {}
-Change Type: {:?}
-
-Code Changes:
-```
-{}
-```
-
-Analyze and respond in this JSON format:
-{{
-    "supports_intent": true/false,
-    "reasoning": "Detailed explanation of whether these changes help fulfill the test intent",
-    "relevant_changes": ["list of specific changes that are relevant to the test intent"],
-    "confidence": 0.85
-}}
-
-Consider:
-1. Does this change implement or fix functionality needed by the target functions/files?
-2. Are there bug fixes that would help tests pass?
-3. Are there new implementations of required functionality?
-4. Does this change directly relate to the user's intent?
-5. Looking at the target code context, do these changes address what's needed?
-
-Respond ONLY with valid JSON:"#,
-        user_intent,
-        target_functions,
-        target_files,
-        function_context,
-        file_context,
-        file_change.path,
-        file_change.status,
-        content
-    );
-
-    let response = ask_openai_internal(&prompt, api_key).await?;
-    let json_str = extract_json_from_response(&response);
+    let json_str = extract_json_from_response(&response_text);
 
     match serde_json::from_str::<serde_json::Value>(&json_str) {
         Ok(json) => {
@@ -466,15 +426,15 @@ Respond ONLY with valid JSON:"#,
         }
         Err(_) => {
             // Fallback parsing
-            let supports_intent = response.to_lowercase().contains("true")
-                || response.to_lowercase().contains("yes")
-                || response.to_lowercase().contains("supports");
+            let supports_intent = response_text.to_lowercase().contains("true")
+                || response_text.to_lowercase().contains("yes")
+                || response_text.to_lowercase().contains("supports");
 
             Ok(FileIntentAnalysis {
                 file_path: file_change.path.clone(),
                 change_type: file_change.status.clone(),
                 supports_intent,
-                reasoning: response.clone(),
+                reasoning: response_text.clone(),
                 relevant_changes: vec![],
             })
         }
@@ -549,4 +509,111 @@ Respond with just the assessment text (no JSON):"#,
 
     let assessment = ask_openai_internal(&prompt, api_key).await?;
     Ok(assessment.trim().to_string())
+}
+
+/// Create system message for intent verification analysis
+pub fn intent_verification_system_rules() -> ChatCompletionRequestMessage {
+    ChatCompletionRequestMessage::System(
+        "You are an AI specialized in code analysis for test intent verification.\n\
+         - Analyze code changes in context of test requirements\n\
+         - Determine if changes support making tests pass\n\
+         - Identify relevant changes that fulfill user intent\n\
+         - Return strict JSON with reasoning\n"
+            .into(),
+    )
+}
+
+/// Add test target context (functions and files that need to work)
+pub fn add_test_target_context(
+    targets_with_code: &TestTargetsWithCode,
+) -> Vec<ChatCompletionRequestMessage> {
+    let mut context = String::from("TEST TARGETS:\n\n");
+
+    // Add function targets with their code
+    if !targets_with_code.function_contents.is_empty() {
+        context.push_str("Functions that need to work:\n");
+        for func in &targets_with_code.function_contents {
+            if let Some(ref code) = func.content {
+                context.push_str(&format!(
+                    "- Function '{}' in {}:\n```\n{}\n```\n\n",
+                    func.name,
+                    func.file_path.as_deref().unwrap_or("unknown"),
+                    code
+                ));
+            } else {
+                context.push_str(&format!(
+                    "- Function '{}' (not found in codebase)\n",
+                    func.name
+                ));
+            }
+        }
+    }
+
+    // Add file targets
+    if !targets_with_code.file_contents.is_empty() {
+        context.push_str("\nFiles that need to work:\n");
+        for file in &targets_with_code.file_contents {
+            if file.error.is_none() {
+                context.push_str(&format!(
+                    "- File '{}': {} bytes\n",
+                    file.path,
+                    file.content.len()
+                ));
+            } else {
+                context.push_str(&format!(
+                    "- File '{}' (error: {})\n",
+                    file.path,
+                    file.error.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
+
+    let messages = vec![
+        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(context.clone()),
+            name: None,
+        }),
+        ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: Some(
+                "Acknowledged. I will analyze changes in context of these test targets.".into(),
+            ),
+            name: None,
+            ..Default::default()
+        }),
+    ];
+
+    println!("\n🎯 TEST TARGET CONTEXT:");
+    println!("{}", context);
+    println!("---");
+
+    messages
+}
+
+/// Add file change context for analysis
+pub fn add_file_change_context(
+    file_change: &FileChange,
+    user_intent: &str,
+) -> ChatCompletionRequestMessage {
+    let content = file_change.content.as_deref().unwrap_or("[No content]");
+
+    let message_content = format!(
+        "USER INTENT: \"{}\"\n\n\
+         CHANGED FILE: {}\n\
+         CHANGE TYPE: {:?}\n\n\
+         CODE CHANGES:\n\
+         ```\n{}\n```\n\n\
+         Analyze if these changes support fulfilling the user intent and making the test targets work. \
+         Respond in JSON format with: supports_intent (bool), reasoning (string), relevant_changes (array), confidence (float).",
+        user_intent, file_change.path, file_change.status, content
+    );
+
+    println!("\n📄 FILE CHANGE CONTEXT:");
+    println!("{}", message_content);
+    println!("---");
+
+    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+        content: ChatCompletionRequestUserMessageContent::Text(message_content),
+        name: None,
+    })
 }
