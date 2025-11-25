@@ -377,68 +377,109 @@ async fn analyze_file_for_test_intent(
         });
     }
 
-    // Build structured messages using helper functions
+    // Split content into blocks if too large
+    let blocks = if content.len() > 12_000 {
+        split_by_function(content)
+    } else {
+        vec![content.clone()]
+    };
+
+    println!(
+        "\n📄 Analyzing file {} ({} blocks)",
+        file_change.path,
+        blocks.len()
+    );
+
     let config = OpenAIConfig::new().with_api_key(api_key);
     let client = Client::with_config(config);
 
-    let mut messages = vec![intent_verification_system_rules()];
-    messages.extend(add_test_target_context(targets_with_code));
-    messages.push(add_file_change_context(file_change, user_intent));
+    let mut all_supports_intent = Vec::new();
+    let mut all_reasoning = Vec::new();
+    let mut all_relevant_changes = Vec::new();
 
-    let request = CreateChatCompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
-        messages,
-        ..Default::default()
-    };
+    // Analyze each block
+    for (i, block) in blocks.iter().enumerate() {
+        let mut messages = vec![intent_verification_system_rules()];
+        messages.extend(add_test_target_context(targets_with_code));
+        messages.push(add_file_change_context_for_block(
+            file_change,
+            user_intent,
+            block,
+            i + 1,
+            blocks.len(),
+        ));
 
-    let response = client.chat().create(request).await?;
-    let response_text = response
-        .choices
-        .get(0)
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_else(|| "No response.".to_string());
+        let request = CreateChatCompletionRequest {
+            model: "gpt-3.5-turbo".to_string(),
+            messages,
+            ..Default::default()
+        };
 
-    let json_str = extract_json_from_response(&response_text);
+        let response = client.chat().create(request).await?;
+        let response_text = response
+            .choices
+            .get(0)
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_else(|| "No response.".to_string());
 
-    match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(json) => {
-            let supports_intent = json["supports_intent"].as_bool().unwrap_or(false);
-            let reasoning = json["reasoning"]
-                .as_str()
-                .unwrap_or("No reasoning provided")
-                .to_string();
-            let relevant_changes = json["relevant_changes"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
+        let json_str = extract_json_from_response(&response_text);
 
-            Ok(FileIntentAnalysis {
-                file_path: file_change.path.clone(),
-                change_type: file_change.status.clone(),
-                supports_intent,
-                reasoning,
-                relevant_changes,
-            })
-        }
-        Err(_) => {
-            // Fallback parsing
-            let supports_intent = response_text.to_lowercase().contains("true")
-                || response_text.to_lowercase().contains("yes")
-                || response_text.to_lowercase().contains("supports");
+        match serde_json::from_str::<serde_json::Value>(&json_str) {
+            Ok(json) => {
+                let supports_intent = json["supports_intent"].as_bool().unwrap_or(false);
+                let reasoning = json["reasoning"]
+                    .as_str()
+                    .unwrap_or("No reasoning provided")
+                    .to_string();
+                let relevant_changes: Vec<String> = json["relevant_changes"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-            Ok(FileIntentAnalysis {
-                file_path: file_change.path.clone(),
-                change_type: file_change.status.clone(),
-                supports_intent,
-                reasoning: response_text.clone(),
-                relevant_changes: vec![],
-            })
+                all_supports_intent.push(supports_intent);
+                all_reasoning.push(reasoning);
+                all_relevant_changes.extend(relevant_changes);
+            }
+            Err(_) => {
+                // Fallback parsing
+                let supports_intent = response_text.to_lowercase().contains("true")
+                    || response_text.to_lowercase().contains("yes")
+                    || response_text.to_lowercase().contains("supports");
+
+                all_supports_intent.push(supports_intent);
+                all_reasoning.push(response_text);
+            }
         }
     }
+
+    // Combine results from all blocks
+    let final_supports_intent = all_supports_intent.iter().any(|&x| x);
+    let final_reasoning = if blocks.len() > 1 {
+        format!(
+            "Analysis of {} blocks:\n{}",
+            blocks.len(),
+            all_reasoning
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("Block {}: {}", i + 1, r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        all_reasoning.first().cloned().unwrap_or_default()
+    };
+
+    Ok(FileIntentAnalysis {
+        file_path: file_change.path.clone(),
+        change_type: file_change.status.clone(),
+        supports_intent: final_supports_intent,
+        reasoning: final_reasoning,
+        relevant_changes: all_relevant_changes,
+    })
 }
 
 /// Generate an overall assessment of whether the changes fulfill the test intent
@@ -590,26 +631,38 @@ pub fn add_test_target_context(
     messages
 }
 
-/// Add file change context for analysis
-pub fn add_file_change_context(
+/// Add file change context for a specific block (for large files split into multiple blocks)
+pub fn add_file_change_context_for_block(
     file_change: &FileChange,
     user_intent: &str,
+    block_content: &str,
+    block_num: usize,
+    total_blocks: usize,
 ) -> ChatCompletionRequestMessage {
-    let content = file_change.content.as_deref().unwrap_or("[No content]");
+    let block_info = if total_blocks > 1 {
+        format!(" (Block {}/{})", block_num, total_blocks)
+    } else {
+        String::new()
+    };
 
     let message_content = format!(
         "USER INTENT: \"{}\"\n\n\
-         CHANGED FILE: {}\n\
+         CHANGED FILE: {}{}\n\
          CHANGE TYPE: {:?}\n\n\
          CODE CHANGES:\n\
          ```\n{}\n```\n\n\
          Analyze if these changes support fulfilling the user intent and making the test targets work. \
          Respond in JSON format with: supports_intent (bool), reasoning (string), relevant_changes (array), confidence (float).",
-        user_intent, file_change.path, file_change.status, content
+        user_intent, file_change.path, block_info, file_change.status, block_content
     );
 
-    println!("\n📄 FILE CHANGE CONTEXT:");
-    println!("{}", message_content);
+    println!(
+        "\n📄 FILE CHANGE CONTEXT for {}{}:",
+        file_change.path, block_info
+    );
+    if total_blocks > 1 {
+        println!("  ⚠️  Large file split into {} blocks", total_blocks);
+    }
     println!("---");
 
     ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
