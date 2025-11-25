@@ -32,7 +32,7 @@ pub extern "C" fn ask_openai(prompt: *const c_char, api_key: *const c_char) -> *
 
     let result = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(ask_openai_internal(prompt_str, api_key_str));
+        .block_on(ask_openai_internal(prompt_str, api_key_str, None, None));
 
     match result {
         Ok(output) => CString::new(output).unwrap().into_raw(),

@@ -19,8 +19,14 @@ use crate::{ChangeType, FileChange};
 pub async fn ask_openai_internal(
     prompt: &str,
     api_key: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let config = OpenAIConfig::new().with_api_key(api_key);
+    let mut config = OpenAIConfig::new().with_api_key(api_key);
+
+    if let Some(url) = base_url {
+        config = config.with_api_base(url);
+    }
 
     let client = Client::with_config(config);
 
@@ -32,7 +38,7 @@ pub async fn ask_openai_internal(
     )];
 
     let request = CreateChatCompletionRequest {
-        model: "gpt-3.5-turbo".to_string(),
+        model: model.unwrap_or("gpt-3.5-turbo").to_string(),
         messages,
         ..Default::default()
     };
@@ -50,6 +56,8 @@ pub async fn ask_openai_internal(
 pub async fn extract_test_targets_with_ai(
     prompt: &str,
     api_key: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<TestTargets, Box<dyn std::error::Error>> {
     let extraction_prompt = format!(
         r#"Extract from the following prompt the list of function names and file names that the user expects to work.
@@ -66,7 +74,7 @@ Prompt:
         prompt = prompt
     );
 
-    let raw_response = ask_openai_internal(&extraction_prompt, api_key).await?;
+    let raw_response = ask_openai_internal(&extraction_prompt, api_key, model, base_url).await?;
 
     let parsed: TestTargets = serde_json::from_str(&raw_response)?;
 
@@ -76,27 +84,31 @@ Prompt:
 /// Analyze git changes to verify if they fulfill the intended test requirements
 ///
 /// # Arguments
-/// * `api_key` - OpenAI API key
 /// * `test_repo_url` - Git repository URL to read test targets from
 /// * `test_commit` - Commit hash to read test target code from
 /// * `solution_repo_url` - Git repository URL for the solution/changes
 /// * `solution_commit1` - First commit hash (before changes)
 /// * `solution_commit2` - Second commit hash (after changes)
 /// * `user_intent` - Original user prompt describing what should work
+/// * `api_key` - OpenAI API key
+/// * `model` - Optional OpenAI model to use (defaults to gpt-3.5-turbo)
+/// * `base_url` - Optional API base URL (for custom endpoints)
 ///
 /// # Returns
 /// * `IntentVerificationResult` - Analysis of whether changes fulfill the intent
 pub async fn verify_test_intent_with_changes(
-    api_key: &str,
     test_repo_url: &str,
     test_commit: &str,
     solution_repo_url: &str,
     solution_commit1: &str,
     solution_commit2: &str,
     user_intent: &str,
+    api_key: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<IntentVerificationResult, Box<dyn std::error::Error>> {
     // First, extract test targets from the user intent using AI
-    let test_targets = extract_test_targets_with_ai(user_intent, api_key).await?;
+    let test_targets = extract_test_targets_with_ai(user_intent, api_key, model, base_url).await?;
 
     // Then, read the actual code of the test targets from the repository at the specified commit
     let targets_with_code = read_test_targets_code(&test_targets, test_repo_url, test_commit)?;
@@ -133,8 +145,15 @@ pub async fn verify_test_intent_with_changes(
         }
 
         // Analyze if this file change supports the test intent
-        match analyze_file_for_test_intent(file_change, &targets_with_code, user_intent, api_key)
-            .await
+        match analyze_file_for_test_intent(
+            file_change,
+            &targets_with_code,
+            user_intent,
+            api_key,
+            model,
+            base_url,
+        )
+        .await
         {
             Ok(analysis) => {
                 if analysis.supports_intent {
@@ -160,6 +179,8 @@ pub async fn verify_test_intent_with_changes(
         &targets_with_code,
         user_intent,
         api_key,
+        model,
+        base_url,
     )
     .await?;
 
@@ -192,6 +213,8 @@ async fn analyze_file_for_test_intent(
     targets_with_code: &TestTargetsWithCode,
     user_intent: &str,
     api_key: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<FileIntentAnalysis, Box<dyn std::error::Error>> {
     let content = match &file_change.content {
         Some(c) => c,
@@ -229,7 +252,10 @@ async fn analyze_file_for_test_intent(
         blocks.len()
     );
 
-    let config = OpenAIConfig::new().with_api_key(api_key);
+    let mut config = OpenAIConfig::new().with_api_key(api_key);
+    if let Some(url) = base_url {
+        config = config.with_api_base(url);
+    }
     let client = Client::with_config(config);
 
     let mut all_supports_intent = Vec::new();
@@ -249,7 +275,7 @@ async fn analyze_file_for_test_intent(
         ));
 
         let request = CreateChatCompletionRequest {
-            model: "gpt-3.5-turbo".to_string(),
+            model: model.unwrap_or("gpt-3.5-turbo").to_string(),
             messages,
             ..Default::default()
         };
@@ -331,6 +357,8 @@ async fn generate_overall_intent_assessment(
     targets_with_code: &TestTargetsWithCode,
     user_intent: &str,
     api_key: &str,
+    model: Option<&str>,
+    base_url: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     // Summarize file analyses
     let summary = file_analyses
@@ -391,7 +419,7 @@ Respond with just the assessment text (no JSON):"#,
         summary
     );
 
-    let assessment = ask_openai_internal(&prompt, api_key).await?;
+    let assessment = ask_openai_internal(&prompt, api_key, model, base_url).await?;
     Ok(assessment.trim().to_string())
 }
 

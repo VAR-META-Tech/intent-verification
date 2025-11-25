@@ -31,13 +31,15 @@ async fn test_verify_typescript_sample_repo() {
     let test_commit = "2fd75de38547b530ea18cbe86d47c5f7e9817265";
 
     match verify_test_intent_with_changes(
-        &api_key,
         test_repo_url,
         test_commit,
         solution_repo_url,
         solution_commit1,
         solution_commit2,
         user_intent,
+        &api_key,
+        None, // model
+        None, // base_url
     )
     .await
     {

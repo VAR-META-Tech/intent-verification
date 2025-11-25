@@ -27,7 +27,7 @@ async fn test_ask_openai_internal() {
     println!("\nTesting with prompt: {}", prompt);
 
     // Call the internal async function directly
-    match ask_openai_internal(prompt, &api_key).await {
+    match ask_openai_internal(prompt, &api_key, None, None).await {
         Ok(result) => {
             println!("Result: {}", result);
             assert!(!result.is_empty(), "Result should not be empty");

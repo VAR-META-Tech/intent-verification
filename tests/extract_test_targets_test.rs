@@ -24,7 +24,7 @@ async fn test_extract_test_targets_simple_prompt() {
 
     let prompt = "I want to test the calculate_sum in math.rs and the process_data in utils.rs";
 
-    match extract_test_targets_with_ai(prompt, &api_key).await {
+    match extract_test_targets_with_ai(prompt, &api_key, None, None).await {
         Ok(targets) => {
             println!("✅ Extracted test targets:");
             println!("  Functions: {:?}", targets.functions);
@@ -84,7 +84,7 @@ async fn test_extract_test_targets_file_paths() {
     let prompt =
         "Test src/main.rs, tests/integration_test.rs, and the helper module in src/helpers/mod.rs";
 
-    match extract_test_targets_with_ai(prompt, &api_key).await {
+    match extract_test_targets_with_ai(prompt, &api_key, None, None).await {
         Ok(targets) => {
             println!("✅ Extracted test targets with file paths:");
             println!("  Functions: {:?}", targets.functions);
