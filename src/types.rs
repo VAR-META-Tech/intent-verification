@@ -1,32 +1,6 @@
 use crate::ChangeType;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CodeAnalysis {
-    pub is_good: bool,
-    pub description: String,
-    pub suggestions: Option<String>,
-    pub confidence: f32, // 0.0 to 1.0
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileAnalysisResult {
-    pub file_path: String,
-    pub change_type: ChangeType,
-    pub analysis: Option<CodeAnalysis>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RepositoryAnalysisResult {
-    pub files: Vec<FileAnalysisResult>,
-    pub is_good: bool,
-    pub total_files: i32,
-    pub analyzed_files: i32,
-    pub good_files: i32,
-    pub files_with_issues: i32,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TestTargets {
     pub functions: Vec<String>,
     pub files: Vec<String>,

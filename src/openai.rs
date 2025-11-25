@@ -10,12 +10,9 @@ use async_openai::{
 
 use crate::git::{read_test_targets_code, split_by_function};
 use crate::types::{
-    CodeAnalysis, FileAnalysisResult, FileIntentAnalysis, IntentVerificationResult,
-    RepositoryAnalysisResult, TestTargets, TestTargetsWithCode,
+    FileIntentAnalysis, IntentVerificationResult, TestTargets, TestTargetsWithCode,
 };
-use crate::utils::{
-    combine_multiple_analyses, extract_json_from_response, parse_analysis_response,
-};
+use crate::utils::extract_json_from_response;
 use crate::{ChangeType, FileChange};
 
 /// Internal async OpenAI function
@@ -48,164 +45,6 @@ pub async fn ask_openai_internal(
         .unwrap_or_else(|| "No response.".to_string());
 
     Ok(reply)
-}
-
-pub async fn analyze_file_change_with_ai(
-    file_change: &FileChange,
-    api_key: &str,
-) -> Result<CodeAnalysis, Box<dyn std::error::Error>> {
-    let content = match &file_change.content {
-        Some(c) => c,
-        None => {
-            return Ok(CodeAnalysis {
-                is_good: true,
-                description: "[No content to analyze]".to_string(),
-                suggestions: None,
-                confidence: 1.0,
-            });
-        }
-    };
-
-    if content == "[Binary file]" || content == "[Non-UTF8 content]" {
-        return Ok(CodeAnalysis {
-            is_good: true, // Not bad, just not analyzable as code
-            description: format!("Skipped binary or unreadable file: {}", file_change.path),
-            suggestions: Some(
-                "Consider if this binary file should be tracked in version control".to_string(),
-            ),
-            confidence: 1.0,
-        });
-    }
-
-    let blocks = if content.len() > 12_000 {
-        split_by_function(content)
-    } else {
-        vec![content.clone()]
-    };
-
-    let mut analyses = vec![];
-
-    for (i, block) in blocks.iter().enumerate() {
-        let prompt = format!(
-            r#"Analyze the following code block (part {}/{} from file {}) and provide a JSON response with this exact structure:
-{{
-    "is_good": true/false,
-    "description": "Brief description of what the code does and its quality",
-    "suggestions": "Optional suggestions for improvement or null",
-    "confidence": 0.85
-}}
-
-Code to analyze:
-```
-{}
-```
-
-Focus on:
-1. Code quality and best practices
-2. Potential bugs or issues
-3. Readability and maintainability
-4. Security concerns if any
-
-Respond ONLY with valid JSON:"#,
-            i + 1,
-            blocks.len(),
-            file_change.path,
-            block
-        );
-
-        let response = ask_openai_internal(&prompt, api_key).await?;
-        analyses.push(response);
-    }
-
-    // Parse the JSON response from OpenAI
-    let combined_analysis = if analyses.len() == 1 {
-        parse_analysis_response(&analyses[0])?
-    } else {
-        // For multiple blocks, combine the analyses
-        combine_multiple_analyses(&analyses)?
-    };
-
-    Ok(combined_analysis)
-}
-
-/// Analyze all changes between two commits in a git repository using AI
-///
-/// # Arguments
-/// * `api_key` - OpenAI API key
-/// * `repo_url` - Git repository URL
-/// * `commit1` - First commit hash (older)
-/// * `commit2` - Second commit hash (newer)
-///
-/// # Returns
-/// * `RepositoryAnalysisResult` - Comprehensive analysis of all changed files
-pub async fn analyze_repository_changes(
-    api_key: &str,
-    repo_url: &str,
-    commit1: &str,
-    commit2: &str,
-) -> Result<RepositoryAnalysisResult, Box<dyn std::error::Error>> {
-    // Get changed files from git
-    let file_changes = crate::git::get_git_changed_files(repo_url, commit1, commit2)?;
-
-    let mut results = Vec::new();
-    let mut has_any_issues = false;
-    let mut analyzed_count = 0;
-    let mut good_count = 0;
-
-    for file_change in &file_changes {
-        match &file_change.status {
-            ChangeType::Deleted => {
-                // Skip deleted files - they don't affect the "is_good" status
-                results.push(FileAnalysisResult {
-                    file_path: file_change.path.clone(),
-                    change_type: file_change.status.clone(),
-                    analysis: None,
-                    error: None,
-                });
-            }
-            _ => {
-                // Analyze the file
-                match analyze_file_change_with_ai(file_change, api_key).await {
-                    Ok(analysis) => {
-                        analyzed_count += 1;
-
-                        if analysis.is_good {
-                            good_count += 1;
-                        } else {
-                            has_any_issues = true;
-                        }
-
-                        results.push(FileAnalysisResult {
-                            file_path: file_change.path.clone(),
-                            change_type: file_change.status.clone(),
-                            analysis: Some(analysis),
-                            error: None,
-                        });
-                    }
-                    Err(e) => {
-                        // Analysis errors count as issues
-                        has_any_issues = true;
-
-                        results.push(FileAnalysisResult {
-                            file_path: file_change.path.clone(),
-                            change_type: file_change.status.clone(),
-                            analysis: None,
-                            error: Some(e.to_string()),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(RepositoryAnalysisResult {
-        files: results,
-        is_good: !has_any_issues,
-        total_files: file_changes.len() as i32,
-        analyzed_files: analyzed_count,
-        good_files: good_count,
-        files_with_issues: analyzed_count - good_count,
-    })
 }
 
 pub async fn extract_test_targets_with_ai(
@@ -421,6 +260,10 @@ async fn analyze_file_for_test_intent(
             .get(0)
             .and_then(|c| c.message.content.clone())
             .unwrap_or_else(|| "No response.".to_string());
+
+        println!("\n🤖 OPENAI RESPONSE for block {}:", i + 1);
+        println!("{}", response_text);
+        println!("---");
 
         let json_str = extract_json_from_response(&response_text);
 
