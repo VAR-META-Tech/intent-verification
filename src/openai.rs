@@ -7,33 +7,15 @@ use async_openai::{
     },
 };
 
-use crate::{ChangeType, FileChange, git::split_by_function};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CodeAnalysis {
-    pub is_good: bool,
-    pub description: String,
-    pub suggestions: Option<String>,
-    pub confidence: f32, // 0.0 to 1.0
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileAnalysisResult {
-    pub file_path: String,
-    pub change_type: ChangeType,
-    pub analysis: Option<CodeAnalysis>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RepositoryAnalysisResult {
-    pub files: Vec<FileAnalysisResult>,
-    pub is_good: bool,
-    pub total_files: i32,
-    pub analyzed_files: i32,
-    pub good_files: i32,
-    pub files_with_issues: i32,
-}
+use crate::git::{read_test_targets_code, split_by_function};
+use crate::types::{
+    CodeAnalysis, FileAnalysisResult, FileIntentAnalysis, IntentVerificationResult,
+    RepositoryAnalysisResult, TestTargets, TestTargetsWithCode,
+};
+use crate::utils::{
+    combine_multiple_analyses, extract_json_from_response, parse_analysis_response,
+};
+use crate::{ChangeType, FileChange};
 
 /// Internal async OpenAI function
 pub async fn ask_openai_internal(
@@ -145,92 +127,6 @@ Respond ONLY with valid JSON:"#,
     Ok(combined_analysis)
 }
 
-fn parse_analysis_response(response: &str) -> Result<CodeAnalysis, Box<dyn std::error::Error>> {
-    // Try to extract JSON from the response
-    let json_str = extract_json_from_response(response);
-
-    match serde_json::from_str::<serde_json::Value>(&json_str) {
-        Ok(json) => {
-            let is_good = json["is_good"].as_bool().unwrap_or(false);
-            let description = json["description"]
-                .as_str()
-                .unwrap_or("No description provided")
-                .to_string();
-            let suggestions = json["suggestions"].as_str().map(|s| s.to_string());
-            let confidence = json["confidence"].as_f64().unwrap_or(0.5) as f32;
-
-            Ok(CodeAnalysis {
-                is_good,
-                description,
-                suggestions,
-                confidence,
-            })
-        }
-        Err(_) => {
-            // Fallback: create analysis from plain text response
-            Ok(CodeAnalysis {
-                is_good: !response.to_lowercase().contains("error")
-                    && !response.to_lowercase().contains("issue")
-                    && !response.to_lowercase().contains("problem"),
-                description: response.to_string(),
-                suggestions: None,
-                confidence: 0.3, // Low confidence for non-structured response
-            })
-        }
-    }
-}
-
-fn extract_json_from_response(response: &str) -> String {
-    // Look for JSON block between ```json and ``` or just find { ... }
-    if let Some(start) = response.find('{') {
-        if let Some(end) = response.find('}') {
-            if end > start {
-                return response[start..=end].to_string();
-            }
-        }
-    }
-
-    // If no JSON found, return the original response
-    response.to_string()
-}
-
-fn combine_multiple_analyses(
-    analyses: &[String],
-) -> Result<CodeAnalysis, Box<dyn std::error::Error>> {
-    let parsed_analyses: Vec<CodeAnalysis> = analyses
-        .iter()
-        .map(|a| parse_analysis_response(a))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let overall_good = parsed_analyses.iter().all(|a| a.is_good);
-    let avg_confidence =
-        parsed_analyses.iter().map(|a| a.confidence).sum::<f32>() / parsed_analyses.len() as f32;
-
-    let combined_description = parsed_analyses
-        .iter()
-        .enumerate()
-        .map(|(i, a)| format!("Block {}: {}", i + 1, a.description))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    let combined_suggestions = parsed_analyses
-        .iter()
-        .filter_map(|a| a.suggestions.as_ref())
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>();
-
-    Ok(CodeAnalysis {
-        is_good: overall_good,
-        description: combined_description,
-        suggestions: if combined_suggestions.is_empty() {
-            None
-        } else {
-            Some(combined_suggestions.join("\n"))
-        },
-        confidence: avg_confidence,
-    })
-}
-
 /// Analyze all changes between two commits in a git repository using AI
 ///
 /// # Arguments
@@ -311,34 +207,6 @@ pub async fn analyze_repository_changes(
     })
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TestTargets {
-    pub functions: Vec<String>,
-    pub files: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TestTargetsWithCode {
-    pub targets: TestTargets,
-    pub file_contents: Vec<FileContent>,
-    pub function_contents: Vec<FunctionContent>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FileContent {
-    pub path: String,
-    pub content: String,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FunctionContent {
-    pub name: String,
-    pub file_path: Option<String>,
-    pub content: Option<String>,
-    pub error: Option<String>,
-}
-
 pub async fn extract_test_targets_with_ai(
     prompt: &str,
     api_key: &str,
@@ -365,333 +233,320 @@ Prompt:
     Ok(parsed)
 }
 
-/// Read the actual code content for the test targets
+/// Analyze git changes to verify if they fulfill the intended test requirements
 ///
 /// # Arguments
-/// * `targets` - The TestTargets containing function and file names
-/// * `src_path` - Path to the source code directory
+/// * `api_key` - OpenAI API key
+/// * `repo_url` - Git repository URL
+/// * `commit1` - First commit hash (before changes)
+/// * `commit2` - Second commit hash (after changes)
+/// * `user_intent` - Original user prompt describing what should work
 ///
 /// # Returns
-/// * `TestTargetsWithCode` - The targets with their actual code content
-pub fn read_test_targets_code(
-    targets: &TestTargets,
-    src_path: &str,
-) -> Result<TestTargetsWithCode, Box<dyn std::error::Error>> {
-    use std::fs;
-    use std::path::Path;
+/// * `IntentVerificationResult` - Analysis of whether changes fulfill the intent
+pub async fn verify_test_intent_with_changes(
+    api_key: &str,
+    solution_repo_url: &str,
+    solution_commit1: &str,
+    solution_commit2: &str,
+    test_repo_url: &str,
+    test_commit: &str,
+    user_intent: &str,
+) -> Result<IntentVerificationResult, Box<dyn std::error::Error>> {
+    // First, extract test targets from the user intent using AI
+    let test_targets = extract_test_targets_with_ai(user_intent, api_key).await?;
 
-    let src_dir = Path::new(src_path);
+    // Then, read the actual code of the test targets from the repository at the specified commit
+    let targets_with_code = read_test_targets_code(&test_targets, test_repo_url, test_commit)?;
 
-    // Read file contents
-    let mut file_contents = Vec::new();
-    for file_path in &targets.files {
-        let full_path = src_dir.join(file_path);
+    // Get changed files from git
+    let file_changes =
+        crate::git::get_git_changed_files(solution_repo_url, solution_commit1, solution_commit2)?;
 
-        match fs::read_to_string(&full_path) {
-            Ok(content) => {
-                file_contents.push(FileContent {
-                    path: file_path.clone(),
-                    content,
-                    error: None,
-                });
-            }
-            Err(e) => {
-                file_contents.push(FileContent {
-                    path: file_path.clone(),
-                    content: String::new(),
-                    error: Some(format!("Failed to read file: {}", e)),
-                });
-            }
-        }
-    }
+    let mut file_analyses = Vec::new();
+    let mut total_supporting = 0;
 
-    // Extract function contents by searching through source files
-    let mut function_contents = Vec::new();
-    for function_name in &targets.functions {
-        let (found_file, found_content) = find_function_in_directory(src_dir, function_name)?;
-
-        function_contents.push(FunctionContent {
-            name: function_name.clone(),
-            file_path: found_file.clone(),
-            content: found_content.clone(),
-            error: if found_content.is_none() {
-                Some(format!(
-                    "Function '{}' not found in source directory",
-                    function_name
-                ))
-            } else {
-                None
-            },
-        });
-    }
-
-    Ok(TestTargetsWithCode {
-        targets: targets.clone(),
-        file_contents,
-        function_contents,
-    })
-}
-
-/// Search for a function definition in a directory recursively
-fn find_function_in_directory(
-    dir: &std::path::Path,
-    function_name: &str,
-) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
-    use std::fs;
-
-    if !dir.is_dir() {
-        return Ok((None, None));
-    }
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            // Skip target and hidden directories
-            if let Some(dir_name) = path.file_name() {
-                let dir_name = dir_name.to_string_lossy();
-                if dir_name == "target" || dir_name.starts_with('.') {
-                    continue;
-                }
-            }
-
-            // Recursively search subdirectories
-            let (found_file, found_content) = find_function_in_directory(&path, function_name)?;
-            if found_content.is_some() {
-                return Ok((found_file, found_content));
-            }
-        } else if is_source_file(&path) {
-            // Search in source code files
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Some(function_content) =
-                    extract_function_from_content(&content, function_name, &path)
-                {
-                    let relative_path = path
-                        .strip_prefix(dir)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .to_string();
-                    return Ok((Some(relative_path), Some(function_content)));
-                }
-            }
-        }
-    }
-
-    Ok((None, None))
-}
-
-/// Check if a file is a source code file (TypeScript, Rust, Python)
-fn is_source_file(path: &std::path::Path) -> bool {
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "jsx")
-    } else {
-        false
-    }
-}
-
-/// Extract a function's content from source code (supports Rust, Python, TypeScript/JavaScript)
-fn extract_function_from_content(
-    content: &str,
-    function_name: &str,
-    file_path: &std::path::Path,
-) -> Option<String> {
-    let ext = file_path.extension()?.to_str()?;
-
-    match ext {
-        "rs" => extract_rust_function(content, function_name),
-        "py" => extract_python_function(content, function_name),
-        "js" | "ts" | "jsx" | "tsx" => extract_javascript_function(content, function_name),
-        _ => None,
-    }
-}
-
-/// Extract Rust function
-fn extract_rust_function(content: &str, function_name: &str) -> Option<String> {
-    // Look for function definitions: pub fn, async fn, fn
-    let patterns = [
-        format!(r"pub async fn {}(", function_name),
-        format!(r"pub fn {}(", function_name),
-        format!(r"async fn {}(", function_name),
-        format!(r"fn {}(", function_name),
-        format!(r"pub unsafe fn {}(", function_name),
-        format!(r"unsafe fn {}(", function_name),
-    ];
-
-    for pattern in &patterns {
-        if let Some(start_pos) = content.find(pattern) {
-            // Find the start of the function (look backwards for any attributes or doc comments)
-            let mut func_start = start_pos;
-            let lines: Vec<&str> = content[..start_pos].lines().collect();
-
-            // Look backwards for attributes and doc comments
-            for line in lines.iter().rev() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("#[")
-                    || trimmed.starts_with("///")
-                    || trimmed.starts_with("//!")
-                    || trimmed.is_empty()
-                {
-                    if let Some(pos) = content[..func_start].rfind(trimmed) {
-                        func_start = pos;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Find the end of the function by counting braces
-            let remaining = &content[start_pos..];
-            if let Some(first_brace) = remaining.find('{') {
-                let mut brace_count = 0;
-                let mut in_string = false;
-                let mut in_char = false;
-                let mut escape_next = false;
-                let mut func_end = start_pos + first_brace;
-
-                for (i, ch) in remaining[first_brace..].char_indices() {
-                    if escape_next {
-                        escape_next = false;
-                        continue;
-                    }
-
-                    match ch {
-                        '\\' => escape_next = true,
-                        '"' if !in_char => in_string = !in_string,
-                        '\'' if !in_string => in_char = !in_char,
-                        '{' if !in_string && !in_char => brace_count += 1,
-                        '}' if !in_string && !in_char => {
-                            brace_count -= 1;
-                            if brace_count == 0 {
-                                func_end = start_pos + first_brace + i + 1;
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if brace_count == 0 {
-                    return Some(content[func_start..func_end].to_string());
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract Python function (def or async def)
-fn extract_python_function(content: &str, function_name: &str) -> Option<String> {
-    let patterns = [
-        format!("async def {}(", function_name),
-        format!("def {}(", function_name),
-    ];
-
-    for pattern in &patterns {
-        if let Some(start_pos) = content.find(pattern) {
-            let mut func_start = start_pos;
-
-            // Look backwards for decorators
-            let lines: Vec<&str> = content[..start_pos].lines().collect();
-            for line in lines.iter().rev() {
-                let trimmed = line.trim();
-                if trimmed.starts_with('@') || trimmed.starts_with('#') || trimmed.is_empty() {
-                    if let Some(pos) = content[..func_start].rfind(trimmed) {
-                        func_start = pos;
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Find end by tracking indentation
-            let lines_after: Vec<&str> = content[start_pos..].lines().collect();
-            if let Some(first_line) = lines_after.first() {
-                let base_indent = first_line.len() - first_line.trim_start().len();
-                let mut func_end = start_pos;
-                let mut found_body = false;
-
-                for line in &lines_after[1..] {
-                    if line.trim().is_empty() {
-                        func_end += line.len() + 1;
-                        continue;
-                    }
-
-                    let line_indent = line.len() - line.trim_start().len();
-                    if found_body && line_indent <= base_indent && !line.trim().is_empty() {
-                        break;
-                    }
-
-                    found_body = true;
-                    func_end += line.len() + 1;
-                }
-
-                return Some(content[func_start..func_end].to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract JavaScript/TypeScript function
-fn extract_javascript_function(content: &str, function_name: &str) -> Option<String> {
-    let patterns = [
-        format!("async function {}(", function_name),
-        format!("function {}(", function_name),
-        format!("const {} = (", function_name),
-        format!("let {} = (", function_name),
-        format!("var {} = (", function_name),
-        format!("const {} = async (", function_name),
-        format!("export function {}(", function_name),
-        format!("export async function {}(", function_name),
-        format!("{}(", function_name), // method definition
-    ];
-
-    for pattern in &patterns {
-        if let Some(start_pos) = content.find(pattern) {
-            if let Some(brace_start) = content[start_pos..].find('{') {
-                let func_end = find_matching_brace(content, start_pos + brace_start)?;
-                return Some(content[start_pos..func_end].to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Find the matching closing brace for an opening brace
-fn find_matching_brace(content: &str, open_brace_pos: usize) -> Option<usize> {
-    let mut brace_count = 0;
-    let mut in_string = false;
-    let in_char = false;
-    let mut escape_next = false;
-    let mut string_char = '"';
-
-    for (i, ch) in content[open_brace_pos..].char_indices() {
-        if escape_next {
-            escape_next = false;
+    // Analyze each changed file in context of the test intent
+    for file_change in &file_changes {
+        if file_change.status == ChangeType::Deleted {
+            // Deleted files generally don't support making tests pass
+            file_analyses.push(FileIntentAnalysis {
+                file_path: file_change.path.clone(),
+                change_type: file_change.status.clone(),
+                supports_intent: false,
+                reasoning: "File was deleted, which typically doesn't help tests pass".to_string(),
+                relevant_changes: vec![],
+            });
             continue;
         }
 
-        match ch {
-            '\\' => escape_next = true,
-            '"' | '\'' if !in_char && !in_string => {
-                in_string = true;
-                string_char = ch;
-            }
-            c if in_string && c == string_char => in_string = false,
-            '{' if !in_string && !in_char => brace_count += 1,
-            '}' if !in_string && !in_char => {
-                brace_count -= 1;
-                if brace_count == 0 {
-                    return Some(open_brace_pos + i + 1);
+        // Analyze if this file change supports the test intent
+        match analyze_file_for_test_intent(file_change, &targets_with_code, user_intent, api_key)
+            .await
+        {
+            Ok(analysis) => {
+                if analysis.supports_intent {
+                    total_supporting += 1;
                 }
+                file_analyses.push(analysis);
             }
-            _ => {}
+            Err(e) => {
+                file_analyses.push(FileIntentAnalysis {
+                    file_path: file_change.path.clone(),
+                    change_type: file_change.status.clone(),
+                    supports_intent: false,
+                    reasoning: format!("Error analyzing file: {}", e),
+                    relevant_changes: vec![],
+                });
+            }
         }
     }
 
-    None
+    // Generate overall assessment using AI
+    let overall_assessment = generate_overall_intent_assessment(
+        &file_analyses,
+        &targets_with_code,
+        user_intent,
+        api_key,
+    )
+    .await?;
+
+    // Calculate confidence based on number of supporting files and AI assessment
+    let support_ratio = if !file_analyses.is_empty() {
+        total_supporting as f32 / file_analyses.len() as f32
+    } else {
+        0.0
+    };
+
+    let is_intent_fulfilled = total_supporting > 0 && support_ratio >= 0.5;
+    let confidence = (support_ratio * 0.7 + 0.3).min(1.0); // Base confidence on support ratio
+
+    Ok(IntentVerificationResult {
+        is_intent_fulfilled,
+        confidence,
+        explanation: format!(
+            "{} out of {} changed files support the test intent",
+            total_supporting,
+            file_analyses.len()
+        ),
+        files_analyzed: file_analyses,
+        overall_assessment,
+    })
+}
+
+/// Analyze a single file change to determine if it supports the test intent
+async fn analyze_file_for_test_intent(
+    file_change: &FileChange,
+    targets_with_code: &TestTargetsWithCode,
+    user_intent: &str,
+    api_key: &str,
+) -> Result<FileIntentAnalysis, Box<dyn std::error::Error>> {
+    let content = match &file_change.content {
+        Some(c) => c,
+        None => {
+            return Ok(FileIntentAnalysis {
+                file_path: file_change.path.clone(),
+                change_type: file_change.status.clone(),
+                supports_intent: false,
+                reasoning: "No content available to analyze".to_string(),
+                relevant_changes: vec![],
+            });
+        }
+    };
+
+    if content == "[Binary file]" || content == "[Non-UTF8 content]" {
+        return Ok(FileIntentAnalysis {
+            file_path: file_change.path.clone(),
+            change_type: file_change.status.clone(),
+            supports_intent: false,
+            reasoning: "Binary or non-UTF8 file, cannot analyze for test intent".to_string(),
+            relevant_changes: vec![],
+        });
+    }
+
+    // Prepare context for AI analysis with actual target code
+    let target_functions = targets_with_code.targets.functions.join(", ");
+    let target_files = targets_with_code.targets.files.join(", ");
+
+    // Include actual function implementations in context
+    let mut function_context = String::new();
+    for func in &targets_with_code.function_contents {
+        if let Some(ref code) = func.content {
+            function_context.push_str(&format!(
+                "\n\nTarget Function '{}' (in {}):\n```\n{}\n```",
+                func.name,
+                func.file_path.as_deref().unwrap_or("unknown"),
+                code
+            ));
+        }
+    }
+
+    // Include target file info
+    let mut file_context = String::new();
+    for file in &targets_with_code.file_contents {
+        if file.error.is_none() {
+            file_context.push_str(&format!(
+                "\n\nTarget File '{}': {} bytes of code",
+                file.path,
+                file.content.len()
+            ));
+        }
+    }
+
+    let prompt = format!(
+        r#"Analyze if the following code changes support making the specified tests work.
+
+User Intent: "{}"
+
+Target Functions: {}
+Target Files: {}
+
+Context - What needs to work:{}{}
+
+Changed File: {}
+Change Type: {:?}
+
+Code Changes:
+```
+{}
+```
+
+Analyze and respond in this JSON format:
+{{
+    "supports_intent": true/false,
+    "reasoning": "Detailed explanation of whether these changes help fulfill the test intent",
+    "relevant_changes": ["list of specific changes that are relevant to the test intent"],
+    "confidence": 0.85
+}}
+
+Consider:
+1. Does this change implement or fix functionality needed by the target functions/files?
+2. Are there bug fixes that would help tests pass?
+3. Are there new implementations of required functionality?
+4. Does this change directly relate to the user's intent?
+5. Looking at the target code context, do these changes address what's needed?
+
+Respond ONLY with valid JSON:"#,
+        user_intent,
+        target_functions,
+        target_files,
+        function_context,
+        file_context,
+        file_change.path,
+        file_change.status,
+        content
+    );
+
+    let response = ask_openai_internal(&prompt, api_key).await?;
+    let json_str = extract_json_from_response(&response);
+
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(json) => {
+            let supports_intent = json["supports_intent"].as_bool().unwrap_or(false);
+            let reasoning = json["reasoning"]
+                .as_str()
+                .unwrap_or("No reasoning provided")
+                .to_string();
+            let relevant_changes = json["relevant_changes"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Ok(FileIntentAnalysis {
+                file_path: file_change.path.clone(),
+                change_type: file_change.status.clone(),
+                supports_intent,
+                reasoning,
+                relevant_changes,
+            })
+        }
+        Err(_) => {
+            // Fallback parsing
+            let supports_intent = response.to_lowercase().contains("true")
+                || response.to_lowercase().contains("yes")
+                || response.to_lowercase().contains("supports");
+
+            Ok(FileIntentAnalysis {
+                file_path: file_change.path.clone(),
+                change_type: file_change.status.clone(),
+                supports_intent,
+                reasoning: response.clone(),
+                relevant_changes: vec![],
+            })
+        }
+    }
+}
+
+/// Generate an overall assessment of whether the changes fulfill the test intent
+async fn generate_overall_intent_assessment(
+    file_analyses: &[FileIntentAnalysis],
+    targets_with_code: &TestTargetsWithCode,
+    user_intent: &str,
+    api_key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Summarize file analyses
+    let summary = file_analyses
+        .iter()
+        .map(|fa| {
+            format!(
+                "- {}: {} ({})",
+                fa.file_path,
+                if fa.supports_intent {
+                    "SUPPORTS"
+                } else {
+                    "DOES NOT SUPPORT"
+                },
+                fa.reasoning
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Summarize what was found vs what was expected
+    let found_functions = targets_with_code
+        .function_contents
+        .iter()
+        .filter(|f| f.content.is_some())
+        .count();
+    let total_functions = targets_with_code.targets.functions.len();
+
+    let found_files = targets_with_code
+        .file_contents
+        .iter()
+        .filter(|f| f.error.is_none())
+        .count();
+    let total_files = targets_with_code.targets.files.len();
+
+    let prompt = format!(
+        r#"Provide a concise overall assessment of whether the code changes fulfill the test intent.
+
+User Intent: "{}"
+Target Functions: {} (found {}/{} in codebase)
+Target Files: {} (found {}/{})
+
+File Analysis Summary:
+{}
+
+Provide a 2-3 sentence assessment covering:
+1. Whether the changes are likely to make the specified tests work
+2. Key supporting or missing changes
+3. Overall confidence in test success
+
+Respond with just the assessment text (no JSON):"#,
+        user_intent,
+        targets_with_code.targets.functions.join(", "),
+        found_functions,
+        total_functions,
+        targets_with_code.targets.files.join(", "),
+        found_files,
+        total_files,
+        summary
+    );
+
+    let assessment = ask_openai_internal(&prompt, api_key).await?;
+    Ok(assessment.trim().to_string())
 }
