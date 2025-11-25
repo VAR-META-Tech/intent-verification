@@ -6,8 +6,6 @@ use async_openai::{
         ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
     },
 };
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
 
 use crate::{ChangeType, FileChange, git::split_by_function};
 
@@ -35,31 +33,6 @@ pub struct RepositoryAnalysisResult {
     pub analyzed_files: i32,
     pub good_files: i32,
     pub files_with_issues: i32,
-}
-
-/// C-compatible structure for FFI results
-#[repr(C)]
-#[derive(Debug)]
-pub struct CRepositoryAnalysisResult {
-    pub is_good: bool,
-    pub total_files: i32,
-    pub analyzed_files: i32,
-    pub good_files: i32,
-    pub files_with_issues: i32,
-    pub files_json: *mut c_char, // JSON string with file details
-}
-
-impl CRepositoryAnalysisResult {
-    pub fn new() -> Self {
-        Self {
-            is_good: false,
-            total_files: 0,
-            analyzed_files: 0,
-            good_files: 0,
-            files_with_issues: 0,
-            files_json: std::ptr::null_mut(),
-        }
-    }
 }
 
 /// Internal async OpenAI function
@@ -94,151 +67,6 @@ pub async fn ask_openai_internal(
     Ok(reply)
 }
 
-/// FFI: Call OpenAI from C/FFI
-#[unsafe(no_mangle)]
-pub extern "C" fn ask_openai(prompt: *const c_char, api_key: *const c_char) -> *mut c_char {
-    let prompt_c_str = unsafe {
-        if prompt.is_null() {
-            return std::ptr::null_mut();
-        }
-        CStr::from_ptr(prompt)
-    };
-
-    let api_key_c_str = unsafe {
-        if api_key.is_null() {
-            return std::ptr::null_mut();
-        }
-        CStr::from_ptr(api_key)
-    };
-
-    let prompt_str = match prompt_c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-
-    let api_key_str = match api_key_c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(ask_openai_internal(prompt_str, api_key_str));
-
-    match result {
-        Ok(output) => CString::new(output).unwrap().into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-/// FFI: Free string allocated by ask_openai
-#[unsafe(no_mangle)]
-pub extern "C" fn free_str(ptr: *mut c_char) {
-    if ptr.is_null() {
-        return;
-    }
-    unsafe {
-        drop(CString::from_raw(ptr));
-    }
-}
-
-/// FFI: Analyze repository changes between two commits
-/// Returns detailed analysis result as C-compatible structure
-#[unsafe(no_mangle)]
-pub extern "C" fn analyze_repository_changes_ffi(
-    api_key: *const c_char,
-    repo_url: *const c_char,
-    commit1: *const c_char,
-    commit2: *const c_char,
-) -> *mut CRepositoryAnalysisResult {
-    // Validate inputs
-    if api_key.is_null() || repo_url.is_null() || commit1.is_null() || commit2.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let api_key_str = unsafe {
-        match CStr::from_ptr(api_key).to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-
-    let repo_url_str = unsafe {
-        match CStr::from_ptr(repo_url).to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-
-    let commit1_str = unsafe {
-        match CStr::from_ptr(commit1).to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-
-    let commit2_str = unsafe {
-        match CStr::from_ptr(commit2).to_str() {
-            Ok(s) => s,
-            Err(_) => return std::ptr::null_mut(),
-        }
-    };
-
-    // Run the async function in a blocking context
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(analyze_repository_changes(
-            api_key_str,
-            repo_url_str,
-            commit1_str,
-            commit2_str,
-        ));
-
-    match result {
-        Ok(analysis_result) => {
-            // Convert files to JSON for detailed information
-            let files_json = match serde_json::to_string(&analysis_result.files) {
-                Ok(json) => match CString::new(json) {
-                    Ok(cstring) => cstring.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                },
-                Err(_) => std::ptr::null_mut(),
-            };
-
-            let c_result = Box::new(CRepositoryAnalysisResult {
-                is_good: analysis_result.is_good,
-                total_files: analysis_result.total_files,
-                analyzed_files: analysis_result.analyzed_files,
-                good_files: analysis_result.good_files,
-                files_with_issues: analysis_result.files_with_issues,
-                files_json,
-            });
-
-            Box::into_raw(c_result)
-        }
-        Err(_) => std::ptr::null_mut(),
-    }
-}
-
-/// FFI: Free CRepositoryAnalysisResult allocated by analyze_repository_changes_ffi
-#[unsafe(no_mangle)]
-pub extern "C" fn free_analysis_result(ptr: *mut CRepositoryAnalysisResult) {
-    if ptr.is_null() {
-        return;
-    }
-
-    unsafe {
-        let result = Box::from_raw(ptr);
-
-        // Free the JSON string if it was allocated
-        if !result.files_json.is_null() {
-            drop(CString::from_raw(result.files_json));
-        }
-
-        // Box will be automatically dropped here
-    }
-}
-
 pub async fn analyze_file_change_with_ai(
     file_change: &FileChange,
     api_key: &str,
@@ -247,7 +75,7 @@ pub async fn analyze_file_change_with_ai(
         Some(c) => c,
         None => {
             return Ok(CodeAnalysis {
-                is_good: true, // Not bad, just no content
+                is_good: true,
                 description: "[No content to analyze]".to_string(),
                 suggestions: None,
                 confidence: 1.0,
@@ -355,7 +183,7 @@ fn parse_analysis_response(response: &str) -> Result<CodeAnalysis, Box<dyn std::
 fn extract_json_from_response(response: &str) -> String {
     // Look for JSON block between ```json and ``` or just find { ... }
     if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
+        if let Some(end) = response.find('}') {
             if end > start {
                 return response[start..=end].to_string();
             }
@@ -481,4 +309,389 @@ pub async fn analyze_repository_changes(
         good_files: good_count,
         files_with_issues: analyzed_count - good_count,
     })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TestTargets {
+    pub functions: Vec<String>,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TestTargetsWithCode {
+    pub targets: TestTargets,
+    pub file_contents: Vec<FileContent>,
+    pub function_contents: Vec<FunctionContent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileContent {
+    pub path: String,
+    pub content: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FunctionContent {
+    pub name: String,
+    pub file_path: Option<String>,
+    pub content: Option<String>,
+    pub error: Option<String>,
+}
+
+pub async fn extract_test_targets_with_ai(
+    prompt: &str,
+    api_key: &str,
+) -> Result<TestTargets, Box<dyn std::error::Error>> {
+    let extraction_prompt = format!(
+        r#"Extract from the following prompt the list of function names and file names that the user expects to work.
+
+Respond ONLY in this strict JSON format:
+{{
+  "functions": ["..."],
+  "files": ["..."]
+}}
+
+Prompt:
+"{prompt}"
+"#,
+        prompt = prompt
+    );
+
+    let raw_response = ask_openai_internal(&extraction_prompt, api_key).await?;
+
+    let parsed: TestTargets = serde_json::from_str(&raw_response)?;
+
+    Ok(parsed)
+}
+
+/// Read the actual code content for the test targets
+///
+/// # Arguments
+/// * `targets` - The TestTargets containing function and file names
+/// * `src_path` - Path to the source code directory
+///
+/// # Returns
+/// * `TestTargetsWithCode` - The targets with their actual code content
+pub fn read_test_targets_code(
+    targets: &TestTargets,
+    src_path: &str,
+) -> Result<TestTargetsWithCode, Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::path::Path;
+
+    let src_dir = Path::new(src_path);
+
+    // Read file contents
+    let mut file_contents = Vec::new();
+    for file_path in &targets.files {
+        let full_path = src_dir.join(file_path);
+
+        match fs::read_to_string(&full_path) {
+            Ok(content) => {
+                file_contents.push(FileContent {
+                    path: file_path.clone(),
+                    content,
+                    error: None,
+                });
+            }
+            Err(e) => {
+                file_contents.push(FileContent {
+                    path: file_path.clone(),
+                    content: String::new(),
+                    error: Some(format!("Failed to read file: {}", e)),
+                });
+            }
+        }
+    }
+
+    // Extract function contents by searching through source files
+    let mut function_contents = Vec::new();
+    for function_name in &targets.functions {
+        let (found_file, found_content) = find_function_in_directory(src_dir, function_name)?;
+
+        function_contents.push(FunctionContent {
+            name: function_name.clone(),
+            file_path: found_file.clone(),
+            content: found_content.clone(),
+            error: if found_content.is_none() {
+                Some(format!(
+                    "Function '{}' not found in source directory",
+                    function_name
+                ))
+            } else {
+                None
+            },
+        });
+    }
+
+    Ok(TestTargetsWithCode {
+        targets: targets.clone(),
+        file_contents,
+        function_contents,
+    })
+}
+
+/// Search for a function definition in a directory recursively
+fn find_function_in_directory(
+    dir: &std::path::Path,
+    function_name: &str,
+) -> Result<(Option<String>, Option<String>), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    if !dir.is_dir() {
+        return Ok((None, None));
+    }
+
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Skip target and hidden directories
+            if let Some(dir_name) = path.file_name() {
+                let dir_name = dir_name.to_string_lossy();
+                if dir_name == "target" || dir_name.starts_with('.') {
+                    continue;
+                }
+            }
+
+            // Recursively search subdirectories
+            let (found_file, found_content) = find_function_in_directory(&path, function_name)?;
+            if found_content.is_some() {
+                return Ok((found_file, found_content));
+            }
+        } else if is_source_file(&path) {
+            // Search in source code files
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Some(function_content) =
+                    extract_function_from_content(&content, function_name, &path)
+                {
+                    let relative_path = path
+                        .strip_prefix(dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    return Ok((Some(relative_path), Some(function_content)));
+                }
+            }
+        }
+    }
+
+    Ok((None, None))
+}
+
+/// Check if a file is a source code file (TypeScript, Rust, Python)
+fn is_source_file(path: &std::path::Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        matches!(ext, "rs" | "py" | "ts" | "tsx" | "js" | "jsx")
+    } else {
+        false
+    }
+}
+
+/// Extract a function's content from source code (supports Rust, Python, TypeScript/JavaScript)
+fn extract_function_from_content(
+    content: &str,
+    function_name: &str,
+    file_path: &std::path::Path,
+) -> Option<String> {
+    let ext = file_path.extension()?.to_str()?;
+
+    match ext {
+        "rs" => extract_rust_function(content, function_name),
+        "py" => extract_python_function(content, function_name),
+        "js" | "ts" | "jsx" | "tsx" => extract_javascript_function(content, function_name),
+        _ => None,
+    }
+}
+
+/// Extract Rust function
+fn extract_rust_function(content: &str, function_name: &str) -> Option<String> {
+    // Look for function definitions: pub fn, async fn, fn
+    let patterns = [
+        format!(r"pub async fn {}(", function_name),
+        format!(r"pub fn {}(", function_name),
+        format!(r"async fn {}(", function_name),
+        format!(r"fn {}(", function_name),
+        format!(r"pub unsafe fn {}(", function_name),
+        format!(r"unsafe fn {}(", function_name),
+    ];
+
+    for pattern in &patterns {
+        if let Some(start_pos) = content.find(pattern) {
+            // Find the start of the function (look backwards for any attributes or doc comments)
+            let mut func_start = start_pos;
+            let lines: Vec<&str> = content[..start_pos].lines().collect();
+
+            // Look backwards for attributes and doc comments
+            for line in lines.iter().rev() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("#[")
+                    || trimmed.starts_with("///")
+                    || trimmed.starts_with("//!")
+                    || trimmed.is_empty()
+                {
+                    if let Some(pos) = content[..func_start].rfind(trimmed) {
+                        func_start = pos;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Find the end of the function by counting braces
+            let remaining = &content[start_pos..];
+            if let Some(first_brace) = remaining.find('{') {
+                let mut brace_count = 0;
+                let mut in_string = false;
+                let mut in_char = false;
+                let mut escape_next = false;
+                let mut func_end = start_pos + first_brace;
+
+                for (i, ch) in remaining[first_brace..].char_indices() {
+                    if escape_next {
+                        escape_next = false;
+                        continue;
+                    }
+
+                    match ch {
+                        '\\' => escape_next = true,
+                        '"' if !in_char => in_string = !in_string,
+                        '\'' if !in_string => in_char = !in_char,
+                        '{' if !in_string && !in_char => brace_count += 1,
+                        '}' if !in_string && !in_char => {
+                            brace_count -= 1;
+                            if brace_count == 0 {
+                                func_end = start_pos + first_brace + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if brace_count == 0 {
+                    return Some(content[func_start..func_end].to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract Python function (def or async def)
+fn extract_python_function(content: &str, function_name: &str) -> Option<String> {
+    let patterns = [
+        format!("async def {}(", function_name),
+        format!("def {}(", function_name),
+    ];
+
+    for pattern in &patterns {
+        if let Some(start_pos) = content.find(pattern) {
+            let mut func_start = start_pos;
+
+            // Look backwards for decorators
+            let lines: Vec<&str> = content[..start_pos].lines().collect();
+            for line in lines.iter().rev() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('@') || trimmed.starts_with('#') || trimmed.is_empty() {
+                    if let Some(pos) = content[..func_start].rfind(trimmed) {
+                        func_start = pos;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Find end by tracking indentation
+            let lines_after: Vec<&str> = content[start_pos..].lines().collect();
+            if let Some(first_line) = lines_after.first() {
+                let base_indent = first_line.len() - first_line.trim_start().len();
+                let mut func_end = start_pos;
+                let mut found_body = false;
+
+                for line in &lines_after[1..] {
+                    if line.trim().is_empty() {
+                        func_end += line.len() + 1;
+                        continue;
+                    }
+
+                    let line_indent = line.len() - line.trim_start().len();
+                    if found_body && line_indent <= base_indent && !line.trim().is_empty() {
+                        break;
+                    }
+
+                    found_body = true;
+                    func_end += line.len() + 1;
+                }
+
+                return Some(content[func_start..func_end].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract JavaScript/TypeScript function
+fn extract_javascript_function(content: &str, function_name: &str) -> Option<String> {
+    let patterns = [
+        format!("async function {}(", function_name),
+        format!("function {}(", function_name),
+        format!("const {} = (", function_name),
+        format!("let {} = (", function_name),
+        format!("var {} = (", function_name),
+        format!("const {} = async (", function_name),
+        format!("export function {}(", function_name),
+        format!("export async function {}(", function_name),
+        format!("{}(", function_name), // method definition
+    ];
+
+    for pattern in &patterns {
+        if let Some(start_pos) = content.find(pattern) {
+            if let Some(brace_start) = content[start_pos..].find('{') {
+                let func_end = find_matching_brace(content, start_pos + brace_start)?;
+                return Some(content[start_pos..func_end].to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the matching closing brace for an opening brace
+fn find_matching_brace(content: &str, open_brace_pos: usize) -> Option<usize> {
+    let mut brace_count = 0;
+    let mut in_string = false;
+    let in_char = false;
+    let mut escape_next = false;
+    let mut string_char = '"';
+
+    for (i, ch) in content[open_brace_pos..].char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+
+        match ch {
+            '\\' => escape_next = true,
+            '"' | '\'' if !in_char && !in_string => {
+                in_string = true;
+                string_char = ch;
+            }
+            c if in_string && c == string_char => in_string = false,
+            '{' if !in_string && !in_char => brace_count += 1,
+            '}' if !in_string && !in_char => {
+                brace_count -= 1;
+                if brace_count == 0 {
+                    return Some(open_brace_pos + i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }

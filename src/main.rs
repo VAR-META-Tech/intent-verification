@@ -1,5 +1,6 @@
 use std::env;
 
+use async_openai::config::OpenAIConfig;
 use colored::Colorize;
 use dotenvy::dotenv;
 use intent_verification::analyze_repository_changes;
@@ -34,12 +35,7 @@ async fn main() {
         Ok(result) => {
             println!("\n📊 Repository Analysis Result:");
 
-            let overall_status = if result.is_good {
-                "✅ ALL FILES LOOK GOOD".bright_green()
-            } else {
-                "⚠️  SOME FILES NEED ATTENTION".bright_red()
-            };
-            println!("  Overall Status: {}", overall_status);
+            println!("  IsGood: {}", result.is_good);
             println!("  Total files changed: {}", result.total_files);
             println!("  Files analyzed: {}", result.analyzed_files);
             println!(
