@@ -22,7 +22,7 @@ async fn test_verify_typescript_sample_repo() {
         }
     };
 
-    let user_intent = "I want to ensure the sum functions work correctly";
+    let user_intent = "I want to ensure the tests/index.test.ts works correctly";
 
     let solution_repo_url = "https://github.com/VAR-META-Tech/intent-verification-sample-ts";
     let solution_commit1 = "2fd75de38547b530ea18cbe86d47c5f7e9817265";

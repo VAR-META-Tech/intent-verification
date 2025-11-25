@@ -60,7 +60,7 @@ pub async fn extract_test_targets_with_ai(
     base_url: Option<&str>,
 ) -> Result<TestTargets, Box<dyn std::error::Error>> {
     let extraction_prompt = format!(
-        r#"Extract from the following prompt the list of function names and file names that the user expects to work.
+        r#"Extract from the following prompt the list of function names and file path that the user expects to work.
 
 Respond ONLY in this strict JSON format:
 {{
@@ -427,10 +427,14 @@ Respond with just the assessment text (no JSON):"#,
 pub fn intent_verification_system_rules() -> ChatCompletionRequestMessage {
     ChatCompletionRequestMessage::System(
         "You are an AI specialized in code analysis for test intent verification.\n\
-         - Analyze code changes in context of test requirements\n\
-         - Determine if changes support making tests pass\n\
-         - Identify relevant changes that fulfill user intent\n\
-         - Return strict JSON with reasoning\n"
+         Your task:\n\
+         1. First, understand the test requirements and what functionality needs to work\n\
+         2. Then, analyze the code changes in the solution commits\n\
+         3. Verify if these code changes would make the specified tests pass\n\
+         4. Determine if changes support fulfilling the user's intent\n\
+         5. Identify specific relevant changes that address test requirements\n\
+         - Return strict JSON format with: supports_intent (bool), reasoning (string), relevant_changes (array), confidence (float)\n\
+         - Be specific about what works and what might still be missing\n"
             .into(),
     )
 }
@@ -439,11 +443,12 @@ pub fn intent_verification_system_rules() -> ChatCompletionRequestMessage {
 pub fn add_test_target_context(
     targets_with_code: &TestTargetsWithCode,
 ) -> Vec<ChatCompletionRequestMessage> {
-    let mut context = String::from("TEST TARGETS:\n\n");
+    let mut context = String::from("STEP 1: UNDERSTAND THE TEST REQUIREMENTS\n\n");
+    context.push_str("These are the tests/functions that need to pass:\n\n");
 
     // Add function targets with their code
     if !targets_with_code.function_contents.is_empty() {
-        context.push_str("Functions that need to work:\n");
+        context.push_str("Test Functions:\n");
         for func in &targets_with_code.function_contents {
             if let Some(ref code) = func.content {
                 context.push_str(&format!(
@@ -454,7 +459,7 @@ pub fn add_test_target_context(
                 ));
             } else {
                 context.push_str(&format!(
-                    "- Function '{}' (not found in codebase)\n",
+                    "- Function '{}' (not found in codebase - may need to be implemented)\n",
                     func.name
                 ));
             }
@@ -463,23 +468,21 @@ pub fn add_test_target_context(
 
     // Add file targets
     if !targets_with_code.file_contents.is_empty() {
-        context.push_str("\nFiles that need to work:\n");
+        context.push_str("\nTest Files:\n");
         for file in &targets_with_code.file_contents {
             if file.error.is_none() {
-                context.push_str(&format!(
-                    "- File '{}': {} bytes\n",
-                    file.path,
-                    file.content.len()
-                ));
+                context.push_str(&format!("- File '{}': {}\n", file.path, file.content));
             } else {
                 context.push_str(&format!(
-                    "- File '{}' (error: {})\n",
+                    "- File '{}' (error reading: {})\n",
                     file.path,
                     file.error.as_deref().unwrap_or("unknown")
                 ));
             }
         }
     }
+
+    context.push_str("\nAnalyze what these tests require to pass successfully.\n");
 
     let messages = vec![
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -488,7 +491,7 @@ pub fn add_test_target_context(
         }),
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content: Some(
-                "Acknowledged. I will analyze changes in context of these test targets.".into(),
+                "Understood. I've analyzed the test requirements. I can see what functionality needs to be implemented for these tests to pass. Ready to verify the solution code changes.".into(),
             ),
             name: None,
             ..Default::default()
@@ -517,16 +520,26 @@ pub fn add_file_change_context_for_block(
     };
 
     let message_content = format!(
-        "USER INTENT: \"{}\"\n\n\
-         CHANGED FILE: {}{}\n\
+        "STEP 2: ANALYZE THE SOLUTION CODE CHANGES\n\n\
+         USER INTENT: \"{}\"\n\n\
+         SOLUTION FILE: {}{}\n\
          CHANGE TYPE: {:?}\n\n\
-         CODE CHANGES:\n\
+         CODE IMPLEMENTATION:\n\
          ```\n{}\n```\n\n\
-         Analyze if these changes support fulfilling the user intent and making the test targets work. \
-         Respond in JSON format with: supports_intent (bool), reasoning (string), relevant_changes (array), confidence (float).",
+         STEP 3: VERIFY IF THIS SOLUTION MAKES THE TESTS PASS\n\
+         - Does this code implement the functionality required by the tests?\n\
+         - Are there any missing implementations or bugs?\n\
+         - Would the test functions work correctly with these changes?\n\
+         - Does this fulfill the user's intent?\n\n\
+         Respond in JSON format with:\n\
+         - supports_intent (bool): true if this code would make the tests pass\n\
+         - reasoning (string): explain what works and what might be missing\n\
+         - relevant_changes (array): list specific code changes that address test requirements\n\
+         - confidence (float): your confidence level (0.0-1.0)",
         user_intent, file_change.path, block_info, file_change.status, block_content
     );
 
+    println!("message_content: {}", message_content);
     println!(
         "\n📄 FILE CHANGE CONTEXT for {}{}:",
         file_change.path, block_info
