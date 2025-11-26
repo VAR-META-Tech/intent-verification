@@ -27,7 +27,14 @@ pub fn get_git_changed_files(
     commit_hash_2: &str,
 ) -> Result<Vec<FileChange>, Box<dyn std::error::Error>> {
     // Create a temporary directory for cloning
-    let temp_dir = format!("/tmp/git_analysis_{}", std::process::id());
+    let temp_dir = format!(
+        "/tmp/git_changed_files_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     // Clean up any existing temp directory
     if Path::new(&temp_dir).exists() {
@@ -160,7 +167,14 @@ pub fn read_test_targets_code(
     commit: &str,
 ) -> Result<TestTargetsWithCode, Box<dyn std::error::Error>> {
     // Create a temporary directory for cloning if needed
-    let temp_dir = format!("/tmp/git_analysis_{}", std::process::id());
+    let temp_dir = format!(
+        "/tmp/git_read_targets_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
 
     // Clean up any existing temp directory
     if Path::new(&temp_dir).exists() {
