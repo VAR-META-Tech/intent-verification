@@ -19,10 +19,8 @@ pub use code_parser::{extract_function_from_content_with_name, is_source_file_by
 
 // OpenAI-related functionality
 mod openai;
-pub use openai::{
-    ask_openai_internal, extract_test_targets_with_ai, verify_test_intent_with_changes,
-};
+pub use openai::{ask_openai_internal, extract_test_targets_with_ai, verify_intent};
 
 // FFI-related functionality
 mod ffi;
-pub use ffi::{ask_openai, free_str};
+pub use ffi::{ask_openai, free_str, verify_intent_c};

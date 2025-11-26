@@ -96,7 +96,7 @@ Prompt:
 ///
 /// # Returns
 /// * `IntentVerificationResult` - Analysis of whether changes fulfill the intent
-pub async fn verify_test_intent_with_changes(
+pub async fn verify_intent(
     test_repo_url: &str,
     test_commit: &str,
     solution_repo_url: &str,

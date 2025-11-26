@@ -1,5 +1,5 @@
 use dotenvy::dotenv;
-use intent_verification::verify_test_intent_with_changes;
+use intent_verification::verify_intent;
 use std::env;
 
 #[tokio::test]
@@ -30,7 +30,7 @@ async fn test_verify_typescript_sample_repo() {
     let test_repo_url = "https://github.com/VAR-META-Tech/intent-verification-sample-ts";
     let test_commit = "2fd75de38547b530ea18cbe86d47c5f7e9817265";
 
-    match verify_test_intent_with_changes(
+    match verify_intent(
         test_repo_url,
         test_commit,
         solution_repo_url,
@@ -123,7 +123,7 @@ async fn test_verify_rust_sample_repo() {
     let test_repo_url = "https://github.com/VAR-META-Tech/intent-verification-sample-rs";
     let test_commit = "818d444d66d63240aa052a390e456eeae8f0638d";
 
-    match verify_test_intent_with_changes(
+    match verify_intent(
         test_repo_url,
         test_commit,
         solution_repo_url,
@@ -216,7 +216,7 @@ async fn test_verify_py_sample_repo() {
     let test_repo_url = "https://github.com/VAR-META-Tech/intent-verification-sample-py";
     let test_commit = "b9ce728166ecc8a376986d624531af90aae3167b";
 
-    match verify_test_intent_with_changes(
+    match verify_intent(
         test_repo_url,
         test_commit,
         solution_repo_url,
